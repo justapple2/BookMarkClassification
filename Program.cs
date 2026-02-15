@@ -1,5 +1,7 @@
+using System.Linq;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using MihaZupan;
@@ -16,11 +18,14 @@ if (bookmarkFiles.Count == 0)
 
 AnsiConsole.MarkupLine($"[green]共发现 {bookmarkFiles.Count} 个书签文件。[/]");
 
-using var httpClient = BuildHttpClient(options.Proxy);
+// 构建两个 HttpClient：一个带代理（如果用户指定），一个直连（无代理）
+// 两个都创建以便后续“代理/不代理各试一次”的逻辑。
+using var clientWithProxy = BuildHttpClient(options.Proxy);
+using var clientDirect = BuildHttpClient(null);
 
 foreach (var bookmarkFile in bookmarkFiles)
 {
-    await ProcessBookmarkFileAsync(bookmarkFile, httpClient, options.TimeoutSeconds);
+    await ProcessBookmarkFileAsync(bookmarkFile, clientWithProxy, clientDirect, options.TimeoutSeconds, !string.IsNullOrWhiteSpace(options.Proxy));
 }
 
 AnsiConsole.MarkupLine("[bold green]处理完成。[/]");
@@ -42,7 +47,7 @@ static UserOptions PromptUserOptions()
     if (browsers.Count == 0)
     {
         AnsiConsole.MarkupLine("[yellow]未选择浏览器，默认同时扫描 Chrome 和 Edge。[/]");
-        browsers.AddRange([BrowserType.Chrome, BrowserType.Edge]);
+        browsers.AddRange(new[] { BrowserType.Chrome, BrowserType.Edge });
     }
 
     var timeoutSeconds = AnsiConsole.Ask<int>("访问超时秒数(建议 5~15)", 8);
@@ -133,7 +138,12 @@ static List<BookmarkFile> DiscoverBookmarkFiles(IReadOnlyCollection<BrowserType>
     return result;
 }
 
-static async Task ProcessBookmarkFileAsync(BookmarkFile bookmarkFile, HttpClient httpClient, int timeoutSeconds)
+static async Task ProcessBookmarkFileAsync(
+    BookmarkFile bookmarkFile,
+    HttpClient clientWithProxy,
+    HttpClient clientDirect,
+    int timeoutSeconds,
+    bool hasProxyConfigured)
 {
     AnsiConsole.WriteLine();
     AnsiConsole.MarkupLine($"[bold cyan]处理 {bookmarkFile.Browser} - {bookmarkFile.ProfileName}[/]");
@@ -166,59 +176,28 @@ static async Task ProcessBookmarkFileAsync(BookmarkFile bookmarkFile, HttpClient
         }
 
         var deadList = new List<DeadBookmark>();
-        await TraverseFolderAsync(rootNode, [], deadList, httpClient, timeoutSeconds, () => checkedCount++, () => deadCount++);
+        await TraverseFolderAsync(rootNode, new List<string>(), deadList, clientWithProxy, clientDirect, timeoutSeconds, hasProxyConfigured, () => checkedCount++, () => deadCount++);
         if (deadList.Count > 0)
         {
             deadByRoot[rootName] = deadList;
         }
     }
 
-    if (deadCount == 0)
-    {
-        AnsiConsole.MarkupLine($"[green]未发现失效书签（检测 {checkedCount} 条 URL）。[/]");
-        return;
-    }
-
-    var folderName = $"Unresponsive_Bookmarks_{DateTime.Now:yyyyMMdd_HHmmss}";
-
-    foreach (var pair in deadByRoot)
-    {
-        if (roots[pair.Key]?.AsObject() is not JsonObject rootNode)
-        {
-            continue;
-        }
-
-        var rootChildren = rootNode["children"]?.AsArray();
-        if (rootChildren is null)
-        {
-            continue;
-        }
-
-        var container = CreateFolder(folderName);
-        foreach (var dead in pair.Value)
-        {
-            AppendWithPath(container, dead.PathFolders, dead.UrlNode);
-        }
-
-        rootChildren.Add(container);
-    }
-
-    var backupPath = bookmarkFile.Path + ".bak_" + DateTime.Now.ToString("yyyyMMddHHmmss");
-    File.Copy(bookmarkFile.Path, backupPath, overwrite: false);
-
-    var jsonText = json.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
-    await File.WriteAllTextAsync(bookmarkFile.Path, jsonText);
-
     AnsiConsole.MarkupLine($"[yellow]检测完成: 共检测 {checkedCount} 条 URL，失效 {deadCount} 条。[/]");
-    AnsiConsole.MarkupLine($"[green]已写回书签并备份到: {backupPath}[/]");
-}
 
+    // 导出到 HTML，保留可访问链接的目录结构，并把所有不可访问的链接放到顶层“不可访问”目录下（按 root / 原路径分组）
+    var exportPath = ExportBookmarksToHtml(bookmarkFile, roots, deadByRoot);
+    AnsiConsole.MarkupLine($"[green]已导出 HTML 书签到: {exportPath}[/]");
+}
+    
 static async Task TraverseFolderAsync(
     JsonObject folder,
     List<string> currentPath,
     List<DeadBookmark> deadList,
-    HttpClient httpClient,
+    HttpClient clientWithProxy,
+    HttpClient clientDirect,
     int timeoutSeconds,
+    bool hasProxy,
     Action checkedCounter,
     Action deadCounter)
 {
@@ -246,12 +225,12 @@ static async Task TraverseFolderAsync(
             }
 
             checkedCounter();
-            var ok = await IsAliveAsync(httpClient, url, timeoutSeconds);
+
+            var ok = await TryIsAliveEitherAsync(clientWithProxy, clientDirect, hasProxy, url, timeoutSeconds);
             if (!ok)
             {
                 var deepClone = child.DeepClone().AsObject();
-                deadList.Add(new DeadBookmark([.. currentPath], deepClone));
-                children.RemoveAt(i);
+                deadList.Add(new DeadBookmark(currentPath.ToArray(), deepClone));
                 deadCounter();
             }
         }
@@ -259,10 +238,44 @@ static async Task TraverseFolderAsync(
         {
             var name = child["name"]?.GetValue<string>() ?? "未命名目录";
             currentPath.Add(name);
-            await TraverseFolderAsync(child, currentPath, deadList, httpClient, timeoutSeconds, checkedCounter, deadCounter);
+            await TraverseFolderAsync(child, currentPath, deadList, clientWithProxy, clientDirect, timeoutSeconds, hasProxy, checkedCounter, deadCounter);
             currentPath.RemoveAt(currentPath.Count - 1);
         }
     }
+}
+
+static async Task<bool> TryIsAliveEitherAsync(HttpClient clientWithProxy, HttpClient clientDirect, bool hasProxy, string url, int timeoutSeconds)
+{
+    // 如果配置了代理，先尝试带代理，再尝试直连；任意一次成功即视为可访问。
+    if (hasProxy)
+    {
+        try
+        {
+            if (await IsAliveAsync(clientWithProxy, url, timeoutSeconds))
+            {
+                return true;
+            }
+        }
+        catch
+        {
+            // 忽略，继续尝试直连
+        }
+    }
+
+    // 直连尝试（或者代理尝试失败后尝试直连）
+    try
+    {
+        if (await IsAliveAsync(clientDirect, url, timeoutSeconds))
+        {
+            return true;
+        }
+    }
+    catch
+    {
+        // 最终失败
+    }
+
+    return false;
 }
 
 static async Task<bool> IsAliveAsync(HttpClient httpClient, string url, int timeoutSeconds)
@@ -363,6 +376,176 @@ static string ToChromeTimestamp(DateTime utc)
     var epoch = new DateTime(1601, 1, 1, 0, 0, 0, DateTimeKind.Utc);
     var microseconds = (long)(utc - epoch).TotalMilliseconds * 1000;
     return microseconds.ToString();
+}
+
+static long ChromeTimestampToUnixSeconds(string? chromeTimestamp)
+{
+    // Chrome timestamp stored as microseconds since 1601-01-01 UTC (as string)
+    if (string.IsNullOrWhiteSpace(chromeTimestamp) || !long.TryParse(chromeTimestamp, out var micro))
+    {
+        return DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+    }
+
+    var epoch = new DateTime(1601, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+    try
+    {
+        var ms = micro / 1000; // to milliseconds
+        var dt = epoch.AddMilliseconds(ms);
+        return new DateTimeOffset(dt).ToUnixTimeSeconds();
+    }
+    catch
+    {
+        return DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+    }
+}
+
+static string ExportBookmarksToHtml(BookmarkFile bookmarkFile, JsonObject roots, Dictionary<string, List<DeadBookmark>> deadByRoot)
+{
+    var myDocs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+    var safeProfile = string.Concat(bookmarkFile.ProfileName.Split(Path.GetInvalidFileNameChars()));
+    var fileName = $"Bookmarks_Export_{bookmarkFile.Browser}_{safeProfile}_{DateTime.Now:yyyyMMdd_HHmmss}.html";
+    var fullPath = Path.Combine(myDocs, fileName);
+
+    // 收集所有不可访问的 URL（按字符串）以便在导出原目录时排除
+    var deadUrlSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    foreach (var list in deadByRoot.Values)
+    {
+        foreach (var dead in list)
+        {
+            var u = dead.UrlNode["url"]?.GetValue<string>();
+            if (!string.IsNullOrWhiteSpace(u))
+            {
+                deadUrlSet.Add(u);
+            }
+        }
+    }
+
+    var sb = new StringBuilder();
+    sb.AppendLine("<!DOCTYPE NETSCAPE-Bookmark-file-1>");
+    sb.AppendLine("<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=UTF-8\">");
+    sb.AppendLine("<TITLE>Bookmarks</TITLE>");
+    sb.AppendLine("<H1>Bookmarks</H1>");
+    sb.AppendLine("<DL><p>");
+
+    var exportFolderName = $"Exported_Bookmarks_{DateTime.Now:yyyyMMdd_HHmmss}";
+
+    // 顶层容器
+    sb.AppendLine($"  <DT><H3>{EscapeHtml(exportFolderName)}</H3>");
+    sb.AppendLine("  <DL><p>");
+
+    // 先写出各 root 的可访问项（保留目录结构），跳过 deadUrlSet 中的 URL
+    foreach (var rootName in new[] { "bookmark_bar", "other", "synced" })
+    {
+        if (roots[rootName]?.AsObject() is not JsonObject rootNode)
+        {
+            continue;
+        }
+
+        sb.AppendLine($"    <DT><H3>{EscapeHtml(rootName)}</H3>");
+        sb.AppendLine("    <DL><p>");
+
+        // 递归写入结构
+        WriteFolderHtml(rootNode, sb, deadUrlSet);
+
+        sb.AppendLine("    </DL><p>");
+    }
+
+    // 追加“不可访问”顶层目录，并按 root -> path 分组放入
+    sb.AppendLine($"    <DT><H3>不可访问</H3>");
+    sb.AppendLine("    <DL><p>");
+
+    foreach (var kv in deadByRoot)
+    {
+        var rootName = kv.Key;
+        var list = kv.Value;
+
+        sb.AppendLine($"      <DT><H3>{EscapeHtml(rootName)}</H3>");
+        sb.AppendLine("      <DL><p>");
+
+        // group by path (preserve original path)
+        var groups = list.GroupBy(d => string.Join(" / ", d.PathFolders ?? Array.Empty<string>()), StringComparer.Ordinal);
+
+        foreach (var group in groups)
+        {
+            var folderLabel = string.IsNullOrEmpty(group.Key) ? "根目录" : group.Key;
+            sb.AppendLine($"        <DT><H3>{EscapeHtml(folderLabel)}</H3>");
+            sb.AppendLine("        <DL><p>");
+
+            foreach (var dead in group)
+            {
+                var url = dead.UrlNode["url"]?.GetValue<string>() ?? string.Empty;
+                var title = dead.UrlNode["name"]?.GetValue<string>() ?? url;
+                var addDate = ChromeTimestampToUnixSeconds(dead.UrlNode["date_added"]?.GetValue<string>());
+                sb.AppendLine($"          <DT><A HREF=\"{EscapeHtml(url)}\" ADD_DATE=\"{addDate}\">{EscapeHtml(title)}</A>");
+            }
+
+            sb.AppendLine("        </DL><p>");
+        }
+
+        sb.AppendLine("      </DL><p>");
+    }
+
+    sb.AppendLine("    </DL><p>"); // 结束 不可访问
+    sb.AppendLine("  </DL><p>"); // 结束 导出根
+    sb.AppendLine("</DL><p>");
+
+    File.WriteAllText(fullPath, sb.ToString(), Encoding.UTF8);
+    return fullPath;
+}
+
+static void WriteFolderHtml(JsonObject folderNode, StringBuilder sb, HashSet<string> deadUrlSet)
+{
+    // 如果 folderNode 本身是一个 folder 对象，写 name，然后处理 children
+    var nameAttr = folderNode["name"]?.GetValue<string>();
+    if (!string.IsNullOrEmpty(nameAttr))
+    {
+        // 这里 folder 的标题写在调用处已经写入，所以此方法只负责 children
+    }
+
+    var children = folderNode["children"]?.AsArray();
+    if (children is null)
+    {
+        return;
+    }
+
+    foreach (var child in children)
+    {
+        if (child is not JsonObject childObj)
+        {
+            continue;
+        }
+
+        var type = childObj["type"]?.GetValue<string>();
+        if (string.Equals(type, "folder", StringComparison.OrdinalIgnoreCase))
+        {
+            var fname = childObj["name"]?.GetValue<string>() ?? "未命名目录";
+            sb.AppendLine($"      <DT><H3>{EscapeHtml(fname)}</H3>");
+            sb.AppendLine("      <DL><p>");
+            WriteFolderHtml(childObj, sb, deadUrlSet);
+            sb.AppendLine("      </DL><p>");
+        }
+        else if (string.Equals(type, "url", StringComparison.OrdinalIgnoreCase))
+        {
+            var url = childObj["url"]?.GetValue<string>() ?? string.Empty;
+            if (deadUrlSet.Contains(url))
+            {
+                // 跳过不可访问的 URL（它们会被收集到“不可访问”目录）
+                continue;
+            }
+
+            var title = childObj["name"]?.GetValue<string>() ?? url;
+            var addDate = ChromeTimestampToUnixSeconds(childObj["date_added"]?.GetValue<string>());
+            var icon = childObj["icon"]?.GetValue<string>();
+            var iconAttr = string.IsNullOrEmpty(icon) ? "" : $" ICON=\"{EscapeHtml(icon)}\"";
+            sb.AppendLine($"        <DT><A HREF=\"{EscapeHtml(url)}\" ADD_DATE=\"{addDate}\"{iconAttr}>{EscapeHtml(title)}</A>");
+        }
+    }
+}
+
+static string EscapeHtml(string? s)
+{
+    if (string.IsNullOrEmpty(s)) return string.Empty;
+    return s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;");
 }
 
 enum BrowserType
